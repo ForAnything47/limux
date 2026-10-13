@@ -4263,9 +4263,11 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
     for (color, button) in swatches {
         let state = state.clone();
         let ws_id = workspace_id.to_string();
-        let pop = popover.clone();
+        let pop = popover.downgrade();
         button.connect_clicked(move |_| {
-            pop.popdown();
+            if let Some(pop) = pop.upgrade() {
+                pop.popdown();
+            }
             set_workspace_color(&state, &ws_id, color);
         });
     }
@@ -4273,9 +4275,11 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
     {
         let state = state.clone();
         let ws_id = workspace_id.to_string();
-        let pop = popover.clone();
+        let pop = popover.downgrade();
         new_tab_btn.connect_clicked(move |_| {
-            pop.popdown();
+            if let Some(pop) = pop.upgrade() {
+                pop.popdown();
+            }
             let (index, directory, row, sidebar_list, target_pane) = {
                 let app_state = state.borrow();
                 let Some(index) = app_state
@@ -4323,33 +4327,67 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
     {
         let state = state.clone();
         let ws_id = workspace_id.to_string();
-        let pop = popover.clone();
+        let pop = popover.downgrade();
         rename_btn.connect_clicked(move |_| {
-            pop.popdown();
+            if let Some(pop) = pop.upgrade() {
+                pop.popdown();
+            }
             begin_workspace_inline_rename(&state, &ws_id);
         });
     }
     {
         let state = state.clone();
         let ws_id = workspace_id.to_string();
-        let pop = popover.clone();
+        let pop = popover.downgrade();
         autostart_btn.connect_clicked(move |_| {
-            pop.popdown();
+            if let Some(pop) = pop.upgrade() {
+                pop.popdown();
+            }
             show_workspace_autostart_dialog(&state, &ws_id);
         });
     }
     {
         let state = state.clone();
         let ws_id = workspace_id.to_string();
-        let pop = popover.clone();
+        let pop = popover.downgrade();
         delete_btn.connect_clicked(move |_| {
-            pop.popdown();
+            if let Some(pop) = pop.upgrade() {
+                pop.popdown();
+            }
             close_workspace_by_id(&state, &ws_id);
             request_session_save(&state);
         });
     }
     {
+        // With the focus still on an item, the unparent would leak the popover
+        // (see `terminal::unset_focus_within`); give it back to whatever had it
+        // before the menu opened, usually a terminal, never to the row or a
+        // widget inside it (Delete removes the row right after). Failing that,
+        // or if it left the window meanwhile, focus the active workspace.
+        let previous_focus = row
+            .root()
+            .and_then(|root| root.focus())
+            .filter(|w| w != row.upcast_ref::<gtk::Widget>() && !w.is_ancestor(row))
+            .map(|w| w.downgrade());
+        let state = state.clone();
         popover.connect_closed(move |p| {
+            if crate::terminal::focus_is_within(p.upcast_ref())
+                && !previous_focus
+                    .as_ref()
+                    .and_then(|w| w.upgrade())
+                    .is_some_and(|w| w.root().is_some() && w.grab_focus())
+            {
+                let active_root = state
+                    .try_borrow()
+                    .ok()
+                    .and_then(|s| s.active_workspace().map(|ws| ws.root.clone()));
+                if let Some(root) = active_root {
+                    focus_workspace_entrypoint(&root);
+                }
+            }
+            if crate::terminal::focus_is_within(p.upcast_ref()) {
+                crate::terminal::unset_focus_within(p.upcast_ref());
+            }
             p.unparent();
         });
     }
