@@ -21,6 +21,7 @@ use crate::link_uri;
 use crate::shortcut_config::NormalizedShortcut;
 
 mod clipboard;
+mod flatpak;
 mod output_activity;
 mod wakeup;
 use clipboard::{
@@ -94,6 +95,7 @@ struct SurfaceEntry {
     on_open_url: Option<Rc<OpenUrlCallback>>,
     on_close: Option<Box<dyn Fn(Option<u32>)>>,
     exit_reported: Cell<bool>,
+    hold_config_error: bool,
     clipboard_context: *mut ClipboardContext,
     // Hover URL preview for OSC 8 hyperlinks. The popover is a child of
     // `gl_area` so it inherits libadwaita's popover styling — matching the
@@ -729,21 +731,23 @@ fn load_ghostty_config() -> ghostty_config_t {
         let config = ghostty_config_new();
         ghostty_config_load_default_files(config);
         ghostty_config_load_recursive_files(config);
+        if flatpak::enabled() {
+            if let Some(contents) = serialized_config(config) {
+                flatpak::load_config(&contents);
+            } else {
+                eprintln!(
+                    "limux: could not serialize Ghostty configuration for Flatpak host commands"
+                );
+                flatpak::config_unavailable();
+            }
+        }
         ghostty_config_finalize(config);
         config
     }
 }
 
 fn load_command_accepts_shell_input(config: ghostty_config_t) -> bool {
-    let serialized = unsafe { ghostty_config_serialize(config) };
-    let contents = if serialized.ptr.is_null() {
-        None
-    } else {
-        let bytes =
-            unsafe { std::slice::from_raw_parts(serialized.ptr.cast::<u8>(), serialized.len) };
-        Some(String::from_utf8_lossy(bytes).into_owned())
-    };
-    unsafe { ghostty_string_free(serialized) };
+    let contents = serialized_config(config);
 
     let command = contents
         .as_deref()
@@ -757,6 +761,20 @@ fn load_command_accepts_shell_input(config: ghostty_config_t) -> bool {
         command.as_deref(),
         initial_command.as_deref(),
     )
+}
+
+fn serialized_config(config: ghostty_config_t) -> Option<String> {
+    let serialized = unsafe { ghostty_config_serialize(config) };
+    let contents = if serialized.ptr.is_null() {
+        None
+    } else {
+        let bytes =
+            unsafe { std::slice::from_raw_parts(serialized.ptr.cast::<u8>(), serialized.len) };
+        Some(String::from_utf8_lossy(bytes).into_owned())
+    };
+    unsafe { ghostty_string_free(serialized) };
+
+    contents
 }
 
 /// Initialize the global Ghostty app. Must be called once before creating surfaces.
@@ -1192,6 +1210,9 @@ unsafe extern "C" fn ghostty_action_cb(
                             .get(&surface_key)
                             .filter(|entry| entry.identity == identity)
                         {
+                            if entry.hold_config_error {
+                                return;
+                            }
                             if let Some(cb) = &entry.on_close {
                                 if !entry.exit_reported.replace(true) {
                                     cb(Some(exit_code));
@@ -1910,13 +1931,38 @@ pub fn create_terminal(
                 config.initial_input = input.as_ptr();
             }
 
-            let surface = unsafe { ghostty_surface_new(app, &config) };
+            let hold_config_error = flatpak::enabled() && flatpak::holds_config_error();
+            let surface = if flatpak::enabled() {
+                config.wait_after_command = flatpak::wait_after_command(startup_command.as_deref());
+                match flatpak::argv(startup_command.as_deref(), &extra_env) {
+                    Ok(argv) => {
+                        let pointers: Vec<_> = argv.iter().map(|arg| arg.as_ptr()).collect();
+                        unsafe {
+                            ghostty_surface_new_with_argv(
+                                app,
+                                &config,
+                                pointers.as_ptr(),
+                                pointers.len(),
+                            )
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("limux: invalid Flatpak terminal command: {error}");
+                        ptr::null_mut()
+                    }
+                }
+            } else {
+                unsafe { ghostty_surface_new(app, &config) }
+            };
             if surface.is_null() {
                 unsafe {
                     drop(Box::from_raw(clipboard_context));
                 }
                 eprintln!("limux: failed to create ghostty surface");
                 return;
+            }
+            if flatpak::enabled() {
+                flatpak::surface_created();
             }
             let surface_key = surface as usize;
             let surface_identity = register_surface_identity(surface_key);
@@ -1997,6 +2043,7 @@ pub fn create_terminal(
                             }
                         })),
                         exit_reported: Cell::new(false),
+                        hold_config_error,
                         on_close: Some(Box::new({
                             let cb = callbacks.clone();
                             move |code| {
