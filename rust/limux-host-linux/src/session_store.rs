@@ -5,7 +5,9 @@ use std::io;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use crate::layout_state::{self, AppSessionState, LoadedSession, WorkspaceState};
+use crate::layout_state::{
+    self, AppSessionState, LoadedSession, WorkspaceGroupState, WorkspaceState,
+};
 
 pub(crate) enum SaveOutcome {
     Saved,
@@ -214,6 +216,35 @@ fn workspace_order(state: &AppSessionState) -> Vec<String> {
         .collect()
 }
 
+/// Merge groups by id: a group this window created, edited or deleted since
+/// its last save takes its local version; any other group keeps the disk
+/// version, so groups made by other windows survive.
+fn merge_groups(
+    previous_local: &AppSessionState,
+    local: &AppSessionState,
+    disk: &AppSessionState,
+) -> Vec<WorkspaceGroupState> {
+    let find = |state: &'_ AppSessionState, id: &str| -> Option<WorkspaceGroupState> {
+        state.groups.iter().find(|group| group.id == id).cloned()
+    };
+    let mut ids: Vec<&str> = Vec::new();
+    for group in local.groups.iter().chain(&disk.groups) {
+        if !ids.contains(&group.id.as_str()) {
+            ids.push(&group.id);
+        }
+    }
+    ids.into_iter()
+        .filter_map(|id| {
+            let ours = find(local, id);
+            if ours != find(previous_local, id) {
+                ours
+            } else {
+                find(disk, id)
+            }
+        })
+        .collect()
+}
+
 fn selected_id(state: &AppSessionState) -> Option<&str> {
     state
         .workspaces
@@ -318,7 +349,26 @@ fn merge_session(
         }
     }
     workspaces.extend(merged.into_values());
-    workspaces.sort_by_key(|workspace| !workspace.favorite);
+    // Ungrouped favorites are pinned first; a group keeps its favorites in place.
+    workspaces.sort_by_key(|workspace| !workspace.favorite || workspace.group_id.is_some());
+
+    // A stale empty-group deletion can race with another window adding a member.
+    // Keep both snapshots recoverable instead of silently orphaning that member.
+    let groups = merge_groups(previous_local, local, disk);
+    let group_ids: BTreeSet<_> = groups.iter().map(|group| group.id.as_str()).collect();
+    let group_conflicts: Vec<_> = workspaces
+        .iter()
+        .filter(|workspace| {
+            workspace
+                .group_id
+                .as_deref()
+                .is_some_and(|id| !group_ids.contains(id))
+        })
+        .map(|workspace| workspace.name.clone())
+        .collect();
+    if !group_conflicts.is_empty() {
+        return Err(group_conflicts);
+    }
 
     // Selection and window chrome are view preferences, not workspace contents.
     let selected = if selected_id(local) != selected_id(previous_local) {
@@ -343,6 +393,9 @@ fn merge_session(
         } else {
             disk.sidebar.clone()
         },
+        // Members name their group per workspace, so membership merges with
+        // workspaces; group metadata merges per group.
+        groups,
         ..AppSessionState::default()
     };
     normalize_pane_ids(&mut result, disk);

@@ -13,6 +13,7 @@ fn workspace(number: u32) -> WorkspaceState {
         folder_path: None,
         autostart_command: None,
         color: None,
+        group_id: None,
         layout: LayoutNodeState::Pane(PaneState {
             pane_id: Some(number),
             active_tab_id: Some(format!("tab-{number}")),
@@ -790,4 +791,157 @@ fn load_persists_ids_minted_for_empty_panes() {
     let (_store, loaded) = SessionStore::load_from_dir(dir.path()).unwrap();
 
     assert_eq!(disk(dir.path()), loaded.state);
+}
+
+fn group(id: &str, name: &str) -> layout_state::WorkspaceGroupState {
+    layout_state::WorkspaceGroupState {
+        id: id.to_string(),
+        name: name.to_string(),
+        color: Some(crate::workspace_color::WorkspaceColor::Teal),
+        collapsed: false,
+        position: 0,
+    }
+}
+
+#[test]
+fn groups_survive_a_remote_save_and_follow_the_newer_edit() {
+    let dir = tempdir().unwrap();
+    let base = initial(dir.path());
+    let (mut a, _) = SessionStore::load_from_dir(dir.path()).unwrap();
+    let (mut b, _) = SessionStore::load_from_dir(dir.path()).unwrap();
+
+    // Window A groups workspace 1.
+    let mut ours = base.clone();
+    ours.groups = vec![group("g", "Backend")];
+    ours.workspaces[0].group_id = Some("g".to_string());
+    saved(&mut a, &ours);
+
+    // Window B, which never touched groups, saves an unrelated addition.
+    let mut theirs = base;
+    theirs.workspaces.push(workspace(3));
+    saved(&mut b, &theirs);
+    let result = disk(dir.path());
+    assert_eq!(result.groups, vec![group("g", "Backend")]);
+    assert_eq!(result.workspaces[0].group_id.as_deref(), Some("g"));
+
+    // A later rename in B wins over A's unchanged groups.
+    let mut renamed = result.clone();
+    renamed.groups[0].name = "Services".to_string();
+    saved(&mut b, &renamed);
+    saved(&mut a, &ours);
+    assert_eq!(disk(dir.path()).groups, vec![group("g", "Services")]);
+}
+
+#[test]
+fn grouped_favorites_keep_their_place_across_saves() {
+    let dir = tempdir().unwrap();
+    let mut base = initial(dir.path());
+    base.workspaces.push(workspace(3));
+    base.groups = vec![group("g", "Backend")];
+    base.workspaces[1].group_id = Some("g".to_string());
+    base.workspaces[2].group_id = Some("g".to_string());
+    base.workspaces[2].favorite = true;
+    // The sidebar order: workspace 1, then group g with its favorite 3 first.
+    base.workspaces.swap(1, 2);
+    layout_state::save_session_atomic_in(dir.path(), &base).unwrap();
+    let (mut store, _) = SessionStore::load_from_dir(dir.path()).unwrap();
+    // Collapsing the group is saved without moving anything.
+    let mut collapsed = base.clone();
+    collapsed.groups[0].collapsed = true;
+    saved(&mut store, &collapsed);
+    let names = |state: &AppSessionState| -> Vec<String> {
+        state
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.name.clone())
+            .collect()
+    };
+    assert_eq!(
+        names(&disk(dir.path())),
+        ["workspace-1", "workspace-3", "workspace-2"]
+    );
+
+    // Reordering again is not mistaken for a clash with another window.
+    let mut reordered = collapsed.clone();
+    reordered.workspaces.rotate_left(1);
+    saved(&mut store, &reordered);
+    assert_eq!(
+        names(&disk(dir.path())),
+        ["workspace-3", "workspace-2", "workspace-1"]
+    );
+}
+
+#[test]
+fn groups_from_two_windows_are_both_kept() {
+    let dir = tempdir().unwrap();
+    let base = initial(dir.path());
+    let (mut a, _) = SessionStore::load_from_dir(dir.path()).unwrap();
+    let (mut b, _) = SessionStore::load_from_dir(dir.path()).unwrap();
+
+    // Window A groups workspace 1 into G1.
+    let mut ours = base.clone();
+    ours.groups = vec![group("g1", "Backend")];
+    ours.workspaces[0].group_id = Some("g1".to_string());
+    saved(&mut a, &ours);
+
+    // Window B, which never saw G1, groups workspace 2 into G2.
+    let mut theirs = base;
+    theirs.groups = vec![group("g2", "Frontend")];
+    theirs.workspaces[1].group_id = Some("g2".to_string());
+    saved(&mut b, &theirs);
+    // Order is irrelevant: groups are placed by their members and position.
+    let ids = |state: &AppSessionState| -> Vec<String> {
+        let mut ids: Vec<String> = state.groups.iter().map(|group| group.id.clone()).collect();
+        ids.sort();
+        ids
+    };
+    assert_eq!(ids(&disk(dir.path())), ["g1", "g2"]);
+
+    // A saves again without touching groups: G2 stays. Deleting G1 drops
+    // only G1.
+    saved(&mut a, &ours);
+    assert_eq!(ids(&disk(dir.path())), ["g1", "g2"]);
+    let mut deleted = ours.clone();
+    deleted.groups.clear();
+    deleted.workspaces[0].group_id = None;
+    saved(&mut a, &deleted);
+    let result = disk(dir.path());
+    assert_eq!(ids(&result), ["g2"]);
+    assert_eq!(result.workspaces[1].group_id.as_deref(), Some("g2"));
+}
+
+#[test]
+fn concurrent_group_deletion_and_membership_addition_conflict_in_both_orders() {
+    for delete_first in [false, true] {
+        let dir = tempdir().unwrap();
+        let mut base = initial(dir.path());
+        base.groups = vec![group("g", "Backend")];
+        layout_state::save_session_atomic_in(dir.path(), &base).unwrap();
+        let (mut a, _) = SessionStore::load_from_dir(dir.path()).unwrap();
+        let (mut b, _) = SessionStore::load_from_dir(dir.path()).unwrap();
+
+        let mut deleted = base.clone();
+        deleted.groups.clear();
+        let mut grouped = base;
+        grouped.workspaces[0].group_id = Some("g".to_string());
+        let (first, second) = if delete_first {
+            (&deleted, &grouped)
+        } else {
+            (&grouped, &deleted)
+        };
+        saved(&mut a, first);
+
+        let SaveOutcome::Conflict {
+            recovery,
+            workspaces,
+        } = b.save(second).unwrap()
+        else {
+            panic!("group deletion and concurrent membership must conflict")
+        };
+        assert_eq!(workspaces, ["workspace-1"]);
+        assert_eq!(disk(dir.path()), *first);
+        let recovered: AppSessionState =
+            serde_json::from_slice(&fs::read(recovery).unwrap()).unwrap();
+        assert_eq!(recovered, *second);
+    }
 }
