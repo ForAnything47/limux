@@ -296,6 +296,8 @@ struct TerminalTabState {
     generation: Rc<()>,
     cwd: Rc<RefCell<Option<String>>>,
     handle: terminal::TerminalHandle,
+    /// Preserve restored bindings even when no external hook record remains.
+    agent: Option<Box<RestorableAgentState>>,
 }
 
 #[derive(Clone)]
@@ -904,6 +906,26 @@ pub fn activate_tab_in_pane(pane_widget: &gtk::Widget, tab_id: &str) -> bool {
         &internals.callbacks,
     );
     true
+}
+
+/// Terminal identities and handles, including tabs that have no surface yet.
+pub(crate) fn terminal_tabs_in_pane(
+    pane_widget: &gtk::Widget,
+) -> Vec<(String, terminal::TerminalHandle)> {
+    let Some(internals) = find_pane_internals(pane_widget) else {
+        return Vec::new();
+    };
+    let tabs = internals
+        .tab_state
+        .borrow()
+        .tabs
+        .iter()
+        .filter_map(|entry| match &entry.kind {
+            TabKind::Terminal { state } => Some((entry.id.clone(), state.handle.clone())),
+            _ => None,
+        })
+        .collect();
+    tabs
 }
 
 /// Set a custom title, or clear it when the title is empty.
@@ -1897,7 +1919,7 @@ fn finish_terminal_respawn(
             state.generation = Rc::new(());
         }
     }
-    term.handle.realize_for_reconnect();
+    term.handle.realize_in_background();
     label.set_tooltip_text(None);
     if active {
         internals.content_stack.set_visible_child_name(tab_id);
@@ -2025,6 +2047,10 @@ fn add_terminal_tab_inner(
                     generation: Rc::new(()),
                     cwd: term_cwd.clone(),
                     handle: term.handle.clone(),
+                    agent: options
+                        .as_ref()
+                        .and_then(|value| value.agent.clone())
+                        .map(Box::new),
                 },
             },
         });
@@ -2445,7 +2471,7 @@ pub fn snapshot_pane_state(pane_widget: &gtk::Widget) -> Option<PaneState> {
             let content = match &entry.kind {
                 TabKind::Terminal { state } => TabContentState::Terminal {
                     cwd: state.cwd.borrow().clone(),
-                    agent: None,
+                    agent: state.agent.as_deref().cloned(),
                     ssh: state.ssh.clone().map(Box::new),
                 },
                 TabKind::Browser { state } => TabContentState::Browser {

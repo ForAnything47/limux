@@ -2557,6 +2557,10 @@ pub fn build_window(app: &adw::Application) {
 
     window.present();
 
+    // Realize every restored tab so background agents come back on their own.
+    // Without this, a restored session stays dead until its tab is clicked.
+    schedule_startup_eager_restore(&state);
+
     // Ask the compositor for server-side decorations when it supports the
     // KDE server-decoration protocol (see the header-bar decision above).
     // libadwaita marks the window client-decorated, which makes GtkWindow
@@ -7097,6 +7101,74 @@ fn close_workspace_by_id_internal(
     }
 }
 
+/// Spread restored process creation across main-loop iterations.
+const EAGER_RESTORE_STEP_MS: u64 = 90;
+
+/// Start restored terminals without selecting their workspace or tab.
+/// Set `LIMUX_EAGER_RESTORE=0` to opt out.
+fn schedule_startup_eager_restore(state: &State) {
+    if matches!(std::env::var("LIMUX_EAGER_RESTORE").as_deref(), Ok("0")) {
+        eprintln!("limux: startup eager restore disabled via LIMUX_EAGER_RESTORE=0");
+        return;
+    }
+
+    let state = state.clone();
+    // Let the initial workspace finish its first frame before starting agents.
+    glib::timeout_add_local_once(std::time::Duration::from_millis(600), move || {
+        run_startup_eager_restore(&state);
+    });
+}
+
+fn run_startup_eager_restore(state: &State) {
+    let mut tabs = {
+        let app_state = state.borrow();
+        app_state
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.split_container.panes())
+            .flat_map(|pane| pane::terminal_tabs_in_pane(&pane))
+            .filter_map(|(id, handle)| (!handle.health().realized).then_some(id))
+            .collect::<Vec<_>>()
+            .into_iter()
+    };
+    let total = tabs.len();
+    if total == 0 {
+        return;
+    }
+    eprintln!("limux: startup eager restore sweeping {total} tabs");
+    let state = Rc::downgrade(state);
+    glib::timeout_add_local(
+        std::time::Duration::from_millis(EAGER_RESTORE_STEP_MS),
+        move || {
+            let Some(state) = state.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if !state.borrow().window.is_visible() {
+                return glib::ControlFlow::Break;
+            }
+            let Some(tab_id) = tabs.next() else {
+                eprintln!("limux: startup eager restore requested ({total} tabs)");
+                return glib::ControlFlow::Break;
+            };
+            // A queued tab can move or close before its turn. Resolve its current
+            // owner, then release the state borrow before GTK emits callbacks.
+            let terminal = {
+                let app_state = state.borrow();
+                app_state
+                    .workspaces
+                    .iter()
+                    .flat_map(|workspace| workspace.split_container.panes())
+                    .flat_map(|pane| pane::terminal_tabs_in_pane(&pane))
+                    .find_map(|(id, handle)| (id == tab_id).then_some(handle))
+            };
+            if let Some(terminal) = terminal {
+                terminal.realize_in_background();
+            }
+            glib::ControlFlow::Continue
+        },
+    );
+}
+
 /// Select a workspace by index and sync the sidebar selection.
 ///
 /// The sidebar row must be selected too, or the list keeps highlighting whatever
@@ -7743,20 +7815,21 @@ fn handle_split_with_tab(
 /// Find the focused pane widget (a gtk::Box with class limux-pane-toolbar child)
 /// by walking up from the currently focused widget.
 fn find_leaf_focused_pane(state: &State) -> Option<(String, gtk::Widget)> {
-    let (ws_id, stack) = {
+    let (ws_id, ws_root, stack) = {
         let s = state.borrow();
         let ws = s.active_workspace()?;
-        (ws.id.clone(), s.stack.clone())
+        (ws.id.clone(), ws.root.clone(), s.stack.clone())
     };
 
     // Get the window's focus widget and walk up to find a pane Box
     let window = stack.root()?.downcast::<gtk::Window>().ok()?;
     let focus = gtk::prelude::GtkWindowExt::focus(&window)?;
 
-    // A closed pane keeps the focus until its teardown frame: skip it.
+    // A retiring pane can retain focus until its teardown frame. Only accept
+    // live panes inside the active workspace.
     let mut widget: Option<gtk::Widget> = Some(focus);
     while let Some(w) = widget {
-        if pane::is_live_pane(&w) {
+        if pane::is_live_pane(&w) && w.is_ancestor(&ws_root) {
             return Some((ws_id, w));
         }
         widget = w.parent();
@@ -9755,3 +9828,7 @@ mod session_save_tests;
 #[cfg(test)]
 #[path = "sidebar_group_tests.rs"]
 mod sidebar_group_tests;
+
+#[cfg(test)]
+#[path = "eager_restore_tests.rs"]
+mod eager_restore_tests;
