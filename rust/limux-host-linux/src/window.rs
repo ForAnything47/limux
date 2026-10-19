@@ -74,6 +74,14 @@ struct Workspace {
     indicator_unread_dot: gtk::Label,
 }
 
+#[derive(Clone)]
+struct FocusRestoreTarget {
+    workspace_id: String,
+    pane_id: u32,
+    tab_id: String,
+    pane_widget: glib::WeakRef<gtk::Widget>,
+}
+
 pub(crate) struct AppState {
     app: adw::Application,
     window: adw::ApplicationWindow,
@@ -99,6 +107,8 @@ pub(crate) struct AppState {
     sidebar: SidebarLayout,
     /// Header rows of the groups in `sidebar`, by group id.
     group_headers: HashMap<String, sidebar_groups::GroupHeader>,
+    last_focused_surface: Option<FocusRestoreTarget>,
+    pending_focus_restore: Option<FocusRestoreTarget>,
     shortcuts: Rc<ResolvedShortcutConfig>,
     stack: gtk::Stack,
     sidebar_list: gtk::ListBox,
@@ -2247,6 +2257,8 @@ pub fn build_window(app: &adw::Application) {
         active_idx: 0,
         sidebar: SidebarLayout::default(),
         group_headers: HashMap::new(),
+        last_focused_surface: None,
+        pending_focus_restore: None,
         shortcuts,
         stack: stack.clone(),
         indicator_box: indicator_box.clone(),
@@ -2297,8 +2309,27 @@ pub fn build_window(app: &adw::Application) {
         let state = state.clone();
         window.connect_is_active_notify(move |window| {
             if !window.is_active() {
+                let rename_entry = state
+                    .try_borrow()
+                    .ok()
+                    .and_then(|s| find_active_rename_entry(&s.sidebar_list));
+                if let Some(entry) = rename_entry {
+                    let target = state
+                        .try_borrow()
+                        .ok()
+                        .and_then(|s| s.last_focused_surface.clone());
+                    if let Ok(mut app_state) = state.try_borrow_mut() {
+                        app_state.pending_focus_restore = target;
+                    }
+                    // Some window backends do not send focus.leave when an
+                    // external application takes activation. Commit the edit
+                    // explicitly so both backends preserve deactivation
+                    // semantics.
+                    entry.emit_activate();
+                }
                 return;
             }
+            restore_pending_focus_if_idle(&state, window.upcast_ref());
             let workspace_id = state
                 .borrow()
                 .active_workspace()
@@ -2306,6 +2337,13 @@ pub fn build_window(app: &adw::Application) {
             if let Some(workspace_id) = workspace_id {
                 clear_visible_tab_unread(&state, &workspace_id);
             }
+        });
+    }
+
+    {
+        let state = state.clone();
+        window.connect_focus_widget_notify(move |window| {
+            record_last_focused_surface_from_window(&state, window.upcast_ref());
         });
     }
 
@@ -4819,6 +4857,7 @@ fn begin_inline_rename(
         child = widget.next_sibling();
     }
 
+    let restore_target = capture_focus_restore_target(state);
     let entry = gtk::Entry::builder()
         .text(current_name)
         .hexpand(true)
@@ -4839,6 +4878,7 @@ fn begin_inline_rename(
     let on_commit = Rc::new(on_commit);
     let commit = {
         let commit_guard = commit_guard.clone();
+        let restore_target = restore_target.clone();
         move |entry: &gtk::Entry, return_focus: bool| {
             if commit_guard.get() {
                 return;
@@ -4850,28 +4890,18 @@ fn begin_inline_rename(
                 on_commit(&state_for_commit, next_name);
             }
 
-            // Removing the entry while it holds the focus hands it to the
-            // row's star button: clear it instead. After an Enter or a click,
-            // once that event has run, give it to the active workspace unless
-            // the click took it. A window deactivation (Alt-Tab away) takes
-            // nothing back.
+            // Removing a focused entry leaves the target to the caller. After
+            // an Enter or a click, return focus unless the click took it. A
+            // window deactivation records a deferred restore for reactivation.
             if crate::terminal::focus_is_within(entry.upcast_ref()) {
                 let window = entry.root().and_downcast::<gtk::Window>();
                 crate::terminal::unset_focus_within(entry.upcast_ref());
                 if let Some(window) = window.filter(|_| return_focus) {
-                    let state = state_for_commit.clone();
-                    glib::idle_add_local_once(move || {
-                        if GtkWindowExt::focus(&window).is_some() {
-                            return;
-                        }
-                        let active_root = state
-                            .try_borrow()
-                            .ok()
-                            .and_then(|s| s.active_workspace().map(|ws| ws.root.clone()));
-                        if let Some(root) = active_root {
-                            focus_workspace_entrypoint(&root);
-                        }
-                    });
+                    schedule_focus_restore_if_idle(
+                        &state_for_commit,
+                        &window,
+                        restore_target.clone(),
+                    );
                 }
             }
 
@@ -4883,18 +4913,39 @@ fn begin_inline_rename(
     {
         let commit = commit.clone();
         entry.connect_activate(move |entry| {
-            commit(entry, true);
+            let return_focus = entry
+                .root()
+                .and_downcast::<gtk::Window>()
+                .is_some_and(|window| window.is_active());
+            commit(entry, return_focus);
         });
     }
     {
         let commit = commit.clone();
+        let state = state.clone();
         let focus = gtk::EventControllerFocus::new();
         focus.connect_leave(move |controller| {
             if let Some(widget) = controller.widget() {
                 if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
-                    // The focus is still in the entry only when the window
-                    // itself lost it.
+                    let window = entry.root().and_downcast::<gtk::Window>();
                     commit(entry, false);
+                    if let Some(window) = window {
+                        let state = state.clone();
+                        // The controller may leave before the toplevel's
+                        // active notification. Decide after GTK processes
+                        // both signals whether this was an app deactivation.
+                        glib::idle_add_local_once(move || {
+                            if !window.is_active() {
+                                let target = state
+                                    .try_borrow()
+                                    .ok()
+                                    .and_then(|s| s.last_focused_surface.clone());
+                                if let Ok(mut app_state) = state.try_borrow_mut() {
+                                    app_state.pending_focus_restore = target;
+                                }
+                            }
+                        });
+                    }
                 }
             }
         });
@@ -7016,6 +7067,167 @@ fn focus_workspace_entrypoint(root: &gtk::Widget) {
         } else {
             pane.child_focus(gtk::DirectionType::TabForward);
         }
+    }
+}
+
+fn schedule_focus_restore_if_idle(
+    state: &State,
+    window: &gtk::Window,
+    target: Option<FocusRestoreTarget>,
+) {
+    let state = state.clone();
+    let window = window.clone();
+    glib::idle_add_local_once(move || {
+        if !window.is_active() {
+            if let Ok(mut app_state) = state.try_borrow_mut() {
+                app_state.pending_focus_restore = target;
+            }
+            return;
+        }
+        if GtkWindowExt::focus(&window).is_some() {
+            return;
+        }
+        if let Some(target) = target {
+            if let Some(pane_widget) = resolve_focus_restore_target(&state, &target) {
+                // Selecting another tab while Limux was inactive is a
+                // deliberate focus target even before its terminal receives
+                // the first click. Do not switch back to the old tab.
+                if pane::active_surface_summary(&pane_widget)
+                    .is_some_and(|active| active.tab_id != target.tab_id)
+                {
+                    return;
+                }
+                if pane::activate_tab_in_pane(&pane_widget, &target.tab_id) {
+                    return;
+                }
+            }
+        }
+        let active_root = state
+            .try_borrow()
+            .ok()
+            .and_then(|s| s.active_workspace().map(|workspace| workspace.root.clone()));
+        if let Some(root) = active_root {
+            focus_workspace_entrypoint(&root);
+        }
+    });
+}
+
+fn restore_pending_focus_if_idle(state: &State, window: &gtk::Window) {
+    let pending = state
+        .try_borrow_mut()
+        .map(|mut state| state.pending_focus_restore.take())
+        .unwrap_or(None);
+    if let Some(target) = pending {
+        schedule_focus_restore_if_idle(state, window, Some(target));
+    }
+}
+
+fn capture_focus_restore_target(state: &State) -> Option<FocusRestoreTarget> {
+    let (workspace_id, split_container, window, last_target) = {
+        let app_state = state.try_borrow().ok()?;
+        let workspace = app_state.active_workspace()?;
+        (
+            workspace.id.clone(),
+            workspace.split_container.clone(),
+            app_state.window.clone(),
+            app_state.last_focused_surface.clone(),
+        )
+    };
+
+    let mut focused_widget = GtkWindowExt::focus(&window);
+    while let Some(widget) = focused_widget {
+        if pane::is_live_pane(&widget) {
+            if let Some(target) =
+                focus_restore_target_for_pane(&workspace_id, &split_container, &widget)
+            {
+                if let Ok(mut app_state) = state.try_borrow_mut() {
+                    app_state.last_focused_surface = Some(target.clone());
+                }
+                return Some(target);
+            }
+        }
+        focused_widget = widget.parent();
+    }
+
+    if let Some(target) = last_target.filter(|target| target.workspace_id == workspace_id) {
+        if let Some(pane_widget) = resolve_focus_restore_target(state, &target) {
+            return focus_restore_target_for_pane(&workspace_id, &split_container, &pane_widget);
+        }
+    }
+
+    let shown_pane = split_container.shown_pane();
+    let target = focus_restore_target_for_pane(&workspace_id, &split_container, &shown_pane);
+    if let Some(target) = target.as_ref() {
+        if let Ok(mut app_state) = state.try_borrow_mut() {
+            app_state.last_focused_surface = Some(target.clone());
+        }
+    }
+    target
+}
+
+fn focus_restore_target_for_pane(
+    workspace_id: &str,
+    split_container: &SplitTreeContainer,
+    pane_widget: &gtk::Widget,
+) -> Option<FocusRestoreTarget> {
+    if !pane::is_live_pane(pane_widget) || !split_container.contains(pane_widget) {
+        return None;
+    }
+    let surface = pane::active_surface_summary(pane_widget)?;
+    Some(FocusRestoreTarget {
+        workspace_id: workspace_id.to_string(),
+        pane_id: surface.pane_id,
+        tab_id: surface.tab_id,
+        pane_widget: pane_widget.downgrade(),
+    })
+}
+
+fn resolve_focus_restore_target(state: &State, target: &FocusRestoreTarget) -> Option<gtk::Widget> {
+    let pane_widget = target.pane_widget.upgrade()?;
+    let (workspace_id, root, split_container) = {
+        let app_state = state.try_borrow().ok()?;
+        let workspace = app_state.active_workspace()?;
+        (
+            workspace.id.clone(),
+            workspace.root.clone(),
+            workspace.split_container.clone(),
+        )
+    };
+    if workspace_id != target.workspace_id
+        || !pane::is_live_pane(&pane_widget)
+        || !split_container.contains(&pane_widget)
+        || pane::pane_widget_for_root(&root, target.pane_id).as_ref() != Some(&pane_widget)
+        || pane::tab_title(&pane_widget, &target.tab_id).is_none()
+    {
+        return None;
+    }
+    Some(pane_widget)
+}
+
+fn record_last_focused_surface_from_window(state: &State, window: &gtk::Window) {
+    let (workspace_id, split_container) = {
+        let Ok(app_state) = state.try_borrow() else {
+            return;
+        };
+        let Some(workspace) = app_state.active_workspace() else {
+            return;
+        };
+        (workspace.id.clone(), workspace.split_container.clone())
+    };
+
+    let mut focused_widget = GtkWindowExt::focus(window);
+    while let Some(widget) = focused_widget {
+        if pane::is_live_pane(&widget) {
+            if let Some(target) =
+                focus_restore_target_for_pane(&workspace_id, &split_container, &widget)
+            {
+                if let Ok(mut app_state) = state.try_borrow_mut() {
+                    app_state.last_focused_surface = Some(target);
+                }
+                return;
+            }
+        }
+        focused_widget = widget.parent();
     }
 }
 
