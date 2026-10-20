@@ -16,6 +16,7 @@ use crate::control_bridge::{
     BridgeError, ControlCommand, PaneCreateDirection as BridgePaneCreateDirection, PaneCreateType,
     WorkspaceTarget,
 };
+use crate::gui_hooks::{GuiHookContext, GuiHookEvent};
 use crate::keybind_editor;
 use crate::layout_state::{
     self, AppSessionState, LayoutNodeState, LoadedSession, PaneState, WorkspaceState,
@@ -29,6 +30,7 @@ use crate::split_tree::{self, SplitTreeContainer};
 use crate::workspace_color::{self, WorkspaceColor};
 use crate::workspace_group::{Placement, RowRef, SidebarLayout};
 
+mod gui_hooks;
 mod sidebar_groups;
 
 const PANE_CREATE_COMMAND_READY_INTERVAL_MS: u64 = 50;
@@ -2455,7 +2457,7 @@ pub fn build_window(app: &adw::Application) {
     {
         let state = state.clone();
         new_ws_btn.connect_clicked(move |_| {
-            add_workspace(&state, None);
+            add_workspace_from_gui(&state);
         });
     }
 
@@ -2495,7 +2497,7 @@ pub fn build_window(app: &adw::Application) {
                 if payload.contains(':') {
                     return create_workspace_for_tab(&state, &payload);
                 }
-                close_workspace_by_id(&state, &payload);
+                close_workspace_from_gui(&state, &payload);
                 return true;
             }
             false
@@ -2970,7 +2972,7 @@ fn shortcut_match_from_key_press(
 fn dispatch_shortcut_command(state: &State, command: ShortcutCommand) -> bool {
     match command {
         ShortcutCommand::NewWorkspace => {
-            add_workspace(state, None);
+            add_workspace_from_gui(state);
             true
         }
         ShortcutCommand::CloseWorkspace => {
@@ -4694,7 +4696,7 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
             if let Some(pop) = pop.upgrade() {
                 pop.popdown();
             }
-            close_workspace_by_id(&state, &ws_id);
+            close_workspace_from_gui(&state, &ws_id);
             request_session_save(&state);
         });
     }
@@ -5166,6 +5168,15 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
             });
         tab_drag_workspace_seed(source, &title, tab_cwd)
     };
+    let context = GuiHookContext {
+        workspace_name: Some(seed.name.clone()),
+        folder: seed.folder_path.clone().or_else(|| seed.cwd.clone()),
+        ..GuiHookContext::default()
+    };
+    // A skipped default leaves the tab where it is.
+    if !gui_hooks::run_gui_hook(state, GuiHookEvent::OnWorkspaceCreate, &context) {
+        return false;
+    }
     let previous_active_workspace_id = {
         let app_state = state.borrow();
         app_state
@@ -5209,7 +5220,7 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
         let state = state.clone();
         let ws_id = new_workspace_id.clone();
         close_button.connect_clicked(move |_| {
-            close_workspace_by_id(&state, &ws_id);
+            close_workspace_from_gui(&state, &ws_id);
         });
     }
     let (indicator_button, indicator_unread_dot) = build_workspace_indicator(&seed.name);
@@ -5280,6 +5291,11 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
     if pane::move_tab_to_pane(&source_pane, tab_id, &pane.clone().upcast()) {
         apply_top_bar_mode(state);
         request_session_save(state);
+        let context = GuiHookContext {
+            workspace_id: Some(new_workspace_id),
+            ..context
+        };
+        gui_hooks::notify_gui_hook(state, GuiHookEvent::AfterWorkspaceCreate, &context);
         return true;
     }
     close_workspace_by_id_internal(
@@ -5512,19 +5528,20 @@ fn install_workspace_row_interactions(
     }
 }
 
-fn add_workspace(state: &State, working_directory: Option<&str>) {
+/// Add a workspace the user asked for. With the folder prompt on, the hook
+/// runs once a folder is chosen, so a cancelled prompt runs no hook.
+fn add_workspace_from_gui(state: &State) {
     let prompt_for_folder = {
         let s = state.borrow();
         s.workspaces.is_empty() || s.config.borrow().workspace.prompt_for_folder_on_create
     };
-    if prompt_for_folder {
+    // A hook that skips the default action replaces the folder prompt too.
+    if prompt_for_folder && !gui_hooks::hook_skips_default(state, GuiHookEvent::OnWorkspaceCreate) {
         show_workspace_path_dialog(state);
         return;
     }
 
-    let folder = working_directory
-        .map(PathBuf::from)
-        .or_else(dirs::home_dir)
+    let folder = dirs::home_dir()
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("/"));
     let folder_path = folder.to_string_lossy().to_string();
@@ -5533,7 +5550,20 @@ fn add_workspace(state: &State, working_directory: Option<&str>) {
         .map(|segment| segment.to_string_lossy().to_string())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| folder_path.clone());
-    create_workspace_with_folder(state, &name, &folder_path);
+    create_workspace_from_gui(state, &name, &folder_path);
+}
+
+/// Create a workspace in `folder_path` after its GUI hook.
+fn create_workspace_from_gui(state: &State, name: &str, folder_path: &str) {
+    let context = GuiHookContext {
+        workspace_name: Some(name.to_string()),
+        folder: Some(folder_path.to_string()),
+        ..GuiHookContext::default()
+    };
+    if gui_hooks::run_gui_hook(state, GuiHookEvent::OnWorkspaceCreate, &context) {
+        create_workspace_with_folder(state, name, folder_path);
+        gui_hooks::notify_workspace_created(state, context);
+    }
 }
 
 fn active_window(state: &State) -> Option<gtk::Window> {
@@ -5609,7 +5639,7 @@ fn show_workspace_path_dialog(state: &State) {
     open_button.connect_clicked(move |_| {
         match validate_workspace_folder_input(entry_for_open.text().as_str()) {
             Ok(selection) => {
-                create_workspace_with_folder(
+                create_workspace_from_gui(
                     &state_for_open,
                     &selection.name,
                     selection.path_text.as_str(),
@@ -5800,7 +5830,7 @@ fn dispatch_control_command(command: ControlCommand) {
     CONTROL_STATE.with(|slot| {
         let state = slot.borrow().clone();
         if let Some(state) = state {
-            handle_control_command(&state, command);
+            gui_hooks::handling_socket_command(|| handle_control_command(&state, command));
         } else {
             command.respond(Err(crate::control_bridge::BridgeError::internal(
                 "control bridge not initialized",
@@ -6194,6 +6224,9 @@ fn handle_control_command(state: &State, command: ControlCommand) {
         }
         ControlCommand::WorkspaceGroup { request, reply } => {
             let _ = reply.send(sidebar_groups::handle_group_request(state, request));
+        }
+        ControlCommand::GuiHook { request, reply } => {
+            let _ = reply.send(gui_hooks::handle_gui_hook_request(state, request));
         }
         ControlCommand::CloseWorkspace { target, reply } => {
             let resolved = {
@@ -6626,9 +6659,22 @@ fn connect_ssh_target(
 ) {
     let connection = persistence
         .map(|reconnect| crate::ssh_session::SshConnection::new(target.clone(), reconnect));
+    let name = format!("SSH: {}", target.destination());
+    let context = GuiHookContext {
+        workspace_name: Some(name.clone()),
+        command: Some(
+            connection
+                .as_ref()
+                .map_or_else(|| target.command(), |connection| connection.command()),
+        ),
+        ..GuiHookContext::default()
+    };
+    if !gui_hooks::run_gui_hook(state, GuiHookEvent::OnWorkspaceCreate, &context) {
+        return;
+    }
     let workspace = WorkspaceState {
         id: None,
-        name: format!("SSH: {}", target.destination()),
+        name,
         favorite: false,
         cwd: None,
         folder_path: None,
@@ -6648,6 +6694,7 @@ fn connect_ssh_target(
         connection.is_none().then(|| target.command()),
     );
     request_session_save(state);
+    gui_hooks::notify_workspace_created(state, context);
 }
 
 fn add_workspace_from_state(state: &State, workspace: &WorkspaceState) {
@@ -6733,7 +6780,7 @@ fn add_workspace_with_initial_command(
         let state = state.clone();
         let ws_id = id.clone();
         close_button.connect_clicked(move |_| {
-            close_workspace_by_id(&state, &ws_id);
+            close_workspace_from_gui(&state, &ws_id);
         });
     }
 
@@ -7002,7 +7049,16 @@ fn close_workspace(state: &State) {
         s.active_workspace().map(|w| w.id.clone())
     };
     if let Some(id) = id {
-        close_workspace_by_id(state, &id);
+        close_workspace_from_gui(state, &id);
+    }
+}
+
+/// Close a workspace the user asked to delete, after its GUI hook.
+fn close_workspace_from_gui(state: &State, id: &str) {
+    let context = gui_hooks::workspace_hook_context(state, id);
+    if gui_hooks::run_gui_hook(state, GuiHookEvent::OnWorkspaceDelete, &context) {
+        close_workspace_by_id(state, id);
+        gui_hooks::notify_gui_hook(state, GuiHookEvent::AfterWorkspaceDelete, &context);
     }
 }
 
@@ -7762,9 +7818,13 @@ fn remove_pane_internal(state: &State, ws_id: &str, pane_widget: &gtk::Widget, p
 
     let Some(container) = container else { return };
 
-    // If this is the only pane, close the entire workspace
+    // If this is the only pane, close the entire workspace. Its last tab or
+    // pane is already gone, so the delete hook cannot keep it open.
     if container.is_single_pane() {
+        let context = gui_hooks::workspace_hook_context(state, ws_id);
+        gui_hooks::notify_gui_hook(state, GuiHookEvent::OnWorkspaceDelete, &context);
         close_workspace_by_id(state, ws_id);
+        gui_hooks::notify_gui_hook(state, GuiHookEvent::AfterWorkspaceDelete, &context);
         return;
     }
 
@@ -9832,3 +9892,7 @@ mod sidebar_group_tests;
 #[cfg(test)]
 #[path = "eager_restore_tests.rs"]
 mod eager_restore_tests;
+
+#[cfg(test)]
+#[path = "gui_hook_tests.rs"]
+mod gui_hook_tests;
